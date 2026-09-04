@@ -3,9 +3,11 @@ import random
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QPushButton, 
                              QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                              QStackedWidget, QTableWidget, QHeaderView, 
-                             QSplitter, QFrame, QTableWidgetItem)
+                             QSplitter, QFrame, QTableWidgetItem, 
+                             QDialog, QComboBox, QSizePolicy)
 from PyQt5.QtGui import QIcon
-from PyQt5.QtCore import Qt, QSize, QTimer
+from PyQt5.QtCore import Qt, QTimer
+import serial.tools.list_ports
 
 import matplotlib
 matplotlib.use('Qt5Agg')
@@ -13,8 +15,68 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 
-class RealTimePlotCanvas(FigureCanvas):
-    """დინამიური Matplotlib Canvas გრაფიკისთვის"""
+class ConnectionDialog(QDialog):
+    """COM პორტის არჩევის POPUP ფანჯარა"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Serial Port")
+        self.setFixedSize(320, 160)
+        
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #121816;
+                color: #e2e8f0;
+                font-family: 'Segoe UI', Arial, sans-serif;
+            }
+            QLabel { color: #e2e8f0; font-size: 13px; }
+            QComboBox {
+                background-color: #1b2421;
+                color: #e2e8f0;
+                border: 1px solid #2d3748;
+                border-radius: 4px;
+                padding: 5px;
+            }
+            QPushButton {
+                background-color: #0f766e;
+                color: white;
+                border: 1px solid #115e59;
+                border-radius: 5px;
+                padding: 6px;
+                font-weight: bold;
+            }
+            QPushButton:hover { background-color: #059669; }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Available COM Ports:"))
+        
+        self.port_combo = QComboBox()
+        layout.addWidget(self.port_combo)
+
+        btn_layout = QHBoxLayout()
+        self.btn_refresh = QPushButton("Refresh")
+        self.btn_connect = QPushButton("Connect")
+        
+        btn_layout.addWidget(self.btn_refresh)
+        btn_layout.addWidget(self.btn_connect)
+        layout.addLayout(btn_layout)
+
+        self.btn_refresh.clicked.connect(self.populate_ports)
+        self.btn_connect.clicked.connect(self.accept)
+
+        self.populate_ports()
+
+    def populate_ports(self):
+        self.port_combo.clear()
+        ports = serial.tools.list_ports.comports()
+        for p in ports:
+            self.port_combo.addItem(f"{p.device} ({p.description})", p.device)
+
+    def get_selected_port(self):
+        return self.port_combo.currentData()
+
+
+class UniversalPlotCanvas(FigureCanvas):
     def __init__(self, parent=None, width=5, height=3, dpi=100):
         self.fig = Figure(figsize=(width, height), dpi=dpi, facecolor='#121816')
         self.axes = self.fig.add_subplot(111)
@@ -27,25 +89,31 @@ class RealTimePlotCanvas(FigureCanvas):
         super().__init__(self.fig)
         self.setParent(parent)
 
+        # საშუალებას აძლევს გრაფიკს გაიზარდოს Splitter-ის დაქაჩვისას
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.updateGeometry()
+
         self.max_points = 30
         self.x_data = list(range(self.max_points))
         self.y_data = [0.0] * self.max_points
         
-        # ხაზის შექმნა
-        self.line, = self.axes.plot(self.x_data, self.y_data, color='#38bdf8', linewidth=2)
+        self.line, = self.axes.plot(self.x_data, self.y_data, color='#10b981', linewidth=2)
         self.axes.grid(True, color='#2d3748', linestyle='--', alpha=0.5)
+        self.fig.tight_layout()
 
-    def set_line_color(self, color_hex):
-        self.line.set_color(color_hex)
+    def update_figure(self, history_data):
+        if not history_data:
+            return
+            
+        self.y_data = history_data[-self.max_points:]
+        if len(self.y_data) < self.max_points:
+            fill_val = self.y_data[0]
+            self.y_data = [fill_val] * (self.max_points - len(self.y_data)) + self.y_data
 
-    def update_figure(self, new_data_list):
-        self.y_data = new_data_list[-self.max_points:]
         self.line.set_ydata(self.y_data)
-        
         y_min, y_max = min(self.y_data), max(self.y_data)
-        margin = max(5.0, (y_max - y_min) * 0.2)
+        margin = max(2.0, (y_max - y_min) * 0.2)
         self.axes.set_ylim(y_min - margin, y_max + margin)
-        
         self.draw()
 
 
@@ -54,9 +122,10 @@ class SnifferPage(QWidget):
         super().__init__()
         layout = QVBoxLayout(self)
 
-        splitter = QSplitter(Qt.Horizontal)
+        # მთავარი ჰორიზონტალური Splitter (მარცხენა და მარჯვენა მხარეს შორის)
+        main_splitter = QSplitter(Qt.Horizontal)
 
-        # --- LEFT PANEL (60%): Main CAN Live Table ---
+        # --- LEFT PANEL: CAN Live Table ---
         self.can_table = QTableWidget(0, 9)
         self.can_table.setHorizontalHeaderLabels([
             "Timestamp", "ID", "Ext", "RTR", "Dir", "Bus", "Len", "ASCII", "Data"
@@ -64,184 +133,120 @@ class SnifferPage(QWidget):
         header = self.can_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Interactive)
         header.setSectionResizeMode(8, QHeaderView.Stretch)
-
         self.can_table.setStyleSheet("""
-            QTableWidget {
-                background-color: #1b2421;
-                gridline-color: #2d3748;
-                color: #e2e8f0;
-                font-size: 13px;
+            QTableWidget { background-color: #1b2421; gridline-color: #2d3748; color: #e2e8f0; font-size: 13px; }
+            QHeaderView::section { background-color: #0f766e; color: white; font-weight: bold; padding: 4px; border: 1px solid #115e59; }
+        """)
+
+        # --- RIGHT PANEL: Vertical Splitter (ცხრილსა და გრაფიკს შორის Drag-and-Drop) ---
+        right_splitter = QSplitter(Qt.Vertical)
+        right_splitter.setStyleSheet("""
+            QSplitter::handle {
+                background-color: #2d3748;
+                height: 4px;
             }
-            QHeaderView::section {
-                background-color: #0f766e;
-                color: white;
-                font-weight: bold;
-                padding: 4px;
-                border: 1px solid #115e59;
+            QSplitter::handle:hover {
+                background-color: #10b981;
             }
         """)
 
-        # --- RIGHT PANEL (40%): Dashboard ---
-        self.right_panel = QWidget()
-        right_layout = QVBoxLayout(self.right_panel)
-        right_layout.setAlignment(Qt.AlignTop)
+        # 1. ზედა ვიჯეტი: Decoded Signals Table
+        table_container = QWidget()
+        table_layout = QVBoxLayout(table_container)
+        table_layout.setContentsMargins(5, 5, 5, 5)
 
-        # 1. Signals Table (Signal ID / Signal Value)
-        signals_header = QLabel("Decoded Signals (Click row to view graph)")
+        signals_header = QLabel("Decoded Signals")
         signals_header.setStyleSheet("color: #10b981; font-size: 14px; font-weight: bold; margin-bottom: 2px;")
-        right_layout.addWidget(signals_header)
+        table_layout.addWidget(signals_header)
 
-        self.table = QTableWidget(2, 2)
+        self.table = QTableWidget(0, 2)
         self.table.setHorizontalHeaderLabels(["Signal ID", "Signal Value"])
         header2 = self.table.horizontalHeader()
         header2.setSectionResizeMode(0, QHeaderView.Interactive)
         header2.setSectionResizeMode(1, QHeaderView.Stretch)
-        
-        # ინიციალიზაცია 2 სიგნალისთვის
-        self.table.setItem(0, 0, QTableWidgetItem("0x208 (Engine RPM)"))
-        self.table.setItem(0, 1, QTableWidgetItem("100.0"))
-        
-        self.table.setItem(1, 0, QTableWidgetItem("0x316 (Engine Temp)"))
-        self.table.setItem(1, 1, QTableWidgetItem("85.0"))
-
         self.table.setStyleSheet("""
-            QTableWidget {
-                background-color: #1b2421;
-                gridline-color: #2d3748;
-                color: #e2e8f0;
-                font-size: 12px;
-            }
-            QTableWidget::item:selected {
-                background-color: #0f766e;
-                color: #ffffff;
-            }
-            QHeaderView::section {
-                background-color: #115e59;
-                color: white;
-                font-weight: bold;
-                padding: 3px;
-            }
+            QTableWidget { background-color: #1b2421; gridline-color: #2d3748; color: #e2e8f0; font-size: 12px; }
+            QTableWidget::item:selected { background-color: #0f766e; color: #ffffff; }
+            QHeaderView::section { background-color: #115e59; color: white; font-weight: bold; padding: 3px; }
         """)
-        self.table.setMaximumHeight(115)
-        right_layout.addWidget(self.table)
-
-        # ცხრილის რიგზე დაჭერის Event
+        table_layout.addWidget(self.table)
         self.table.cellClicked.connect(self.on_signal_selected)
 
-        # --- 2. Matplotlib Visuals (დინამიური გრაფიკი) ---
-        self.plot_header = QLabel("Live Visualization: 0x208 (Engine RPM)")
-        self.plot_header.setStyleSheet("color: #38bdf8; font-size: 14px; font-weight: bold; margin-top: 5px;")
-        right_layout.addWidget(self.plot_header)
+        # 2. ქვედა ვიჯეტი: Graph Section
+        plot_container = QWidget()
+        plot_layout = QVBoxLayout(plot_container)
+        plot_layout.setContentsMargins(5, 5, 5, 5)
 
-        self.plot_canvas = RealTimePlotCanvas(self, width=5, height=2.8)
-        right_layout.addWidget(self.plot_canvas)
+        self.plot_header = QLabel("Live Visualization: Select a signal")
+        self.plot_header.setStyleSheet("color: #10b981; font-size: 14px; font-weight: bold; margin-top: 2px;")
+        plot_layout.addWidget(self.plot_header)
 
-        # გამყოფი ხაზი
-        line = QFrame()
-        line.setFrameShape(QFrame.HLine)
-        line.setStyleSheet("color: #2d3748; margin: 5px 0px;")
-        right_layout.addWidget(line)
+        self.plot_canvas = UniversalPlotCanvas(self, width=5, height=3)
+        plot_layout.addWidget(self.plot_canvas)
 
-        # 3. Connection Status
-        status_header = QLabel("Connection Status:")
-        status_header.setStyleSheet("color: #94a3b8; font-size: 13px; font-weight: bold;")
+        # ვამატებთ ორივე ვიჯეტს ვერტიკალურ Splitter-ში
+        right_splitter.addWidget(table_container)
+        right_splitter.addWidget(plot_container)
         
-        self.lbl_status = QLabel("● Device: ESP32 (COM3)")
-        self.lbl_status.setStyleSheet("color: #38bdf8; font-size: 12px; padding-left: 5px;")
-        
-        self.lbl_baudrate = QLabel("● Baudrate: 500 kbps")
-        self.lbl_baudrate.setStyleSheet("color: #e2e8f0; font-size: 12px; padding-left: 5px;")
+        # საწყისი პროპორციები (ცხრილი: 200px, გრაფიკი: 400px)
+        right_splitter.setSizes([200, 400])
 
-        right_layout.addWidget(status_header)
-        right_layout.addWidget(self.lbl_status)
-        right_layout.addWidget(self.lbl_baudrate)
+        # ჩასმა მთავარ ჰორიზონტალურ Splitter-ში
+        main_splitter.addWidget(self.can_table)
+        main_splitter.addWidget(right_splitter)
+        main_splitter.setSizes([550, 450])
 
-        # 4. Live Statistics
-        stats_header = QLabel("Live Statistics:")
-        stats_header.setStyleSheet("color: #94a3b8; font-size: 13px; font-weight: bold; margin-top: 5px;")
-
-        self.lbl_fps = QLabel("Frames / Sec: 60 fps")
-        self.lbl_fps.setStyleSheet("color: #10b981; font-size: 13px; font-weight: bold; padding-left: 5px;")
-
-        right_layout.addWidget(stats_header)
-        right_layout.addWidget(self.lbl_fps)
-
-        # მარჯვენა პანელის სტილი
-        self.right_panel.setStyleSheet("""
-            QWidget {
-                background-color: #161e1b;
-                border: 1px solid #2d3748;
-                border-radius: 6px;
-            }
-            QLabel {
-                border: none;
-            }
-        """)
-
-        splitter.addWidget(self.can_table)
-        splitter.addWidget(self.right_panel)
-        splitter.setSizes([550, 450])
-
-        layout.addWidget(splitter)
+        layout.addWidget(main_splitter)
         self.setLayout(layout)
 
-        self.active_signal_index = 0  # 0 = 0x208, 1 = 0x316
-        
-        # სიგნალი 1 (0x208 RPM): თავიდან სტაბილურია (100), მერე იზრდება
-        self.signal_1_history = [100.0] * 30
-        self.step_counter_1 = 0
+        self.signals_data = {}
+        self.selected_signal_id = None
 
-        # სიგნალი 2 (0x316 Temp): ნელ-ნელა იმატებს (85-დან 110-მდე)
-        self.signal_2_history = [85.0] * 30
-        self.step_counter_2 = 0
-
-        # ტაიმერი მონაცემების გენერაციისთვის
+        # ტაიმერის ინიციალიზაცია (არ გაშვიათ ავტომატურად)
         self.timer = QTimer(self)
-        self.timer.timeout.connect(self.generate_mock_data)
-        self.timer.start(200)
+        self.timer.timeout.connect(self.simulate_incoming_can_data)
 
-        self.table.selectRow(0)
+    def process_incoming_signal(self, signal_id: str, new_value: float):
+        if signal_id not in self.signals_data:
+            self.signals_data[signal_id] = []
+            row_count = self.table.rowCount()
+            self.table.insertRow(row_count)
+            self.table.setItem(row_count, 0, QTableWidgetItem(signal_id))
+            self.table.setItem(row_count, 1, QTableWidgetItem(str(new_value)))
+            
+            if self.selected_signal_id is None:
+                self.selected_signal_id = signal_id
+                self.table.selectRow(0)
+                self.plot_header.setText(f"Live Visualization: {signal_id}")
+
+        self.signals_data[signal_id].append(new_value)
+
+        for row in range(self.table.rowCount()):
+            if self.table.item(row, 0).text() == signal_id:
+                self.table.setItem(row, 1, QTableWidgetItem(f"{new_value:.1f}"))
+                break
+
+        if signal_id == self.selected_signal_id:
+            self.plot_canvas.update_figure(self.signals_data[signal_id])
 
     def on_signal_selected(self, row, column):
-        self.active_signal_index = row
-        if row == 0:
-            self.plot_header.setText("Live Visualization: 0x208 (Engine RPM)")
-            self.plot_header.setStyleSheet("color: #38bdf8; font-size: 14px; font-weight: bold; margin-top: 5px;")
-            self.plot_canvas.set_line_color('#38bdf8')  # ლურჯი ხაზი
-        else:
-            self.plot_header.setText("Live Visualization: 0x316 (Engine Temp)")
-            self.plot_header.setStyleSheet("color: #f59e0b; font-size: 14px; font-weight: bold; margin-top: 5px;")
-            self.plot_canvas.set_line_color('#f59e0b')  # ნარინჯისფერი ხაზი
+        signal_id = self.table.item(row, 0).text()
+        self.selected_signal_id = signal_id
+        self.plot_header.setText(f"Live Visualization: {signal_id}")
+        if signal_id in self.signals_data:
+            self.plot_canvas.update_figure(self.signals_data[signal_id])
 
-    def generate_mock_data(self):
-        self.step_counter_1 += 1
-        if self.step_counter_1 < 20:
-            val_1 = 100 + random.uniform(-1.5, 1.5)
-        elif 20 <= self.step_counter_1 < 40:
-            val_1 = self.signal_1_history[-1] + random.uniform(3.5, 7.0)
+    def simulate_incoming_can_data(self):
+        mock_signals = ["0x208 (RPM)", "0x316 (Temp)", "0x1A0 (Speed)", "0x420 (Voltage)"]
+        chosen_id = random.choice(mock_signals)
+        
+        if chosen_id not in self.signals_data:
+            val = random.uniform(50, 100)
         else:
-            self.step_counter_1 = 0
-            val_1 = 100.0
-            
-        self.signal_1_history.pop(0)
-        self.signal_1_history.append(val_1)
-        self.table.setItem(0, 1, QTableWidgetItem(f"{val_1:.1f}"))
+            prev_val = self.signals_data[chosen_id][-1]
+            val = prev_val + random.uniform(-2, 3)
 
-        self.step_counter_2 += 1
-        if self.step_counter_2 < 30:
-            val_2 = self.signal_2_history[-1] + random.uniform(0.1, 0.8)
-        else:
-            self.step_counter_2 = 0
-            val_2 = 85.0
-
-        self.signal_2_history.pop(0)
-        self.signal_2_history.append(val_2)
-        self.table.setItem(1, 1, QTableWidgetItem(f"{val_2:.1f} °C"))
-
-        if self.active_signal_index == 0:
-            self.plot_canvas.update_figure(self.signal_1_history)
-        else:
-            self.plot_canvas.update_figure(self.signal_2_history)
+        self.process_incoming_signal(chosen_id, val)
 
 
 class HistoryPage(QWidget):
@@ -263,16 +268,14 @@ class HistoryPage(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SavvyPy - CAN Bus Analyzer")
+        self.setWindowTitle("SavvyPy - Dynamic CAN Analyzer")
         self.setGeometry(100, 100, 1200, 700)
-        self.setWindowIcon(QIcon("icon.jpg"))
         self.initUI()
 
     def initUI(self):
         central_widget = QWidget(self)
         self.setCentralWidget(central_widget)
-        main_layout = QVBoxLayout()
-        central_widget.setLayout(main_layout)
+        main_layout = QVBoxLayout(central_widget)
 
         self.setStyleSheet("""
             QMainWindow, QWidget {
@@ -282,6 +285,7 @@ class MainWindow(QMainWindow):
             }
         """)
 
+        # --- TOP BUTTONS BAR ---
         top_bar_layout = QHBoxLayout()
         button_style = """
             QPushButton {
@@ -296,6 +300,11 @@ class MainWindow(QMainWindow):
             QPushButton:hover {
                 background-color: #059669;
             }
+            QPushButton:disabled {
+                background-color: #1b2421;
+                color: #4a5568;
+                border: 1px solid #2d3748;
+            }
         """
 
         self.connect_button = QPushButton(" Connect", self)
@@ -305,6 +314,8 @@ class MainWindow(QMainWindow):
         self.sniff_button = QPushButton(" Start Sniffing", self)
         self.sniff_button.setFixedSize(150, 36)
         self.sniff_button.setStyleSheet(button_style)
+        # საწყის ეტაპზე გათიშულია:
+        self.sniff_button.setEnabled(False)
 
         self.btn_history = QPushButton(" History", self)
         self.btn_history.setFixedSize(130, 36)
@@ -317,6 +328,7 @@ class MainWindow(QMainWindow):
 
         main_layout.addLayout(top_bar_layout)
 
+        # --- PAGES STACK ---
         self.stacked_widget = QStackedWidget()
         self.sniffer_page = SnifferPage()
         self.history_page = HistoryPage()
@@ -326,8 +338,62 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(self.stacked_widget)
 
-        self.sniff_button.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(0))
+        # Event-ები
+        self.sniff_button.clicked.connect(self.toggle_sniffing)
         self.btn_history.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(1))
+        self.connect_button.clicked.connect(self.open_connection_dialog)
+
+    def open_connection_dialog(self):
+        dialog = ConnectionDialog(self)
+        if dialog.exec_() == QDialog.Accepted:
+            selected_port = dialog.get_selected_port()
+            if selected_port:
+                self.connect_button.setText(f" Connected ({selected_port})")
+                self.connect_button.setStyleSheet("""
+                    QPushButton {
+                        color: #ffffff;
+                        background-color: #15803d;
+                        border: 1px solid #166534;
+                        border-radius: 6px;
+                        font-size: 14px;
+                        font-weight: bold;
+                        padding: 5px 12px;
+                    }
+                """)
+                # Connect-ის შემდეგ აქტიურდება Start Sniffing
+                self.sniff_button.setEnabled(True)
+
+    def toggle_sniffing(self):
+        if self.sniffer_page.timer.isActive():
+            self.sniffer_page.timer.stop()
+            self.sniff_button.setText(" Start Sniffing")
+            self.sniff_button.setStyleSheet("""
+                QPushButton {
+                    color: #ffffff;
+                    background-color: #0f766e;
+                    border: 1px solid #115e59;
+                    border-radius: 6px;
+                    font-size: 14px;
+                    font-weight: bold;
+                    padding: 5px 12px;
+                }
+                QPushButton:hover { background-color: #059669; }
+            """)
+        else:
+            self.sniffer_page.timer.start(200)
+            self.sniff_button.setText(" Stop Sniffing")
+            self.sniff_button.setStyleSheet("""
+                QPushButton {
+                    color: #ffffff;
+                    background-color: #b91c1c;
+                    border: 1px solid #991b1b;
+                    border-radius: 6px;
+                    font-size: 14px;
+                    font-weight: bold;
+                    padding: 5px 12px;
+                }
+                QPushButton:hover { background-color: #dc2626; }
+            """)
 
 
 if __name__ == "__main__":
