@@ -1,18 +1,21 @@
 import sys
+import os
 import random
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QPushButton, 
-                             QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
-                             QStackedWidget, QTableWidget, QHeaderView, 
-                             QSplitter, QFrame, QTableWidgetItem, 
-                             QDialog, QComboBox, QSizePolicy)
-from PyQt5.QtGui import QIcon
+from datetime import datetime
+from logger import CANLogger
+from plot_canvas import UniversalPlotCanvas
+from history_page import HistoryPage
+
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QPushButton, QWidget, QVBoxLayout, 
+    QHBoxLayout, QLabel, QStackedWidget, QTableWidget, QHeaderView, 
+    QSplitter, QTableWidgetItem, QDialog, QComboBox, QSizePolicy
+)
 from PyQt5.QtCore import Qt, QTimer
 import serial.tools.list_ports
 
 import matplotlib
 matplotlib.use('Qt5Agg')
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
 
 
 class ConnectionDialog(QDialog):
@@ -76,53 +79,14 @@ class ConnectionDialog(QDialog):
         return self.port_combo.currentData()
 
 
-class UniversalPlotCanvas(FigureCanvas):
-    def __init__(self, parent=None, width=5, height=3, dpi=100):
-        self.fig = Figure(figsize=(width, height), dpi=dpi, facecolor='#121816')
-        self.axes = self.fig.add_subplot(111)
-        self.axes.set_facecolor('#1b2421')
-        
-        self.axes.tick_params(colors='#e2e8f0', labelsize=8)
-        for spine in self.axes.spines.values():
-            spine.set_color('#2d3748')
-
-        super().__init__(self.fig)
-        self.setParent(parent)
-
-        # საშუალებას აძლევს გრაფიკს გაიზარდოს Splitter-ის დაქაჩვისას
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.updateGeometry()
-
-        self.max_points = 30
-        self.x_data = list(range(self.max_points))
-        self.y_data = [0.0] * self.max_points
-        
-        self.line, = self.axes.plot(self.x_data, self.y_data, color='#10b981', linewidth=2)
-        self.axes.grid(True, color='#2d3748', linestyle='--', alpha=0.5)
-        self.fig.tight_layout()
-
-    def update_figure(self, history_data):
-        if not history_data:
-            return
-            
-        self.y_data = history_data[-self.max_points:]
-        if len(self.y_data) < self.max_points:
-            fill_val = self.y_data[0]
-            self.y_data = [fill_val] * (self.max_points - len(self.y_data)) + self.y_data
-
-        self.line.set_ydata(self.y_data)
-        y_min, y_max = min(self.y_data), max(self.y_data)
-        margin = max(2.0, (y_max - y_min) * 0.2)
-        self.axes.set_ylim(y_min - margin, y_max + margin)
-        self.draw()
-
-
 class SnifferPage(QWidget):
     def __init__(self):
         super().__init__()
         layout = QVBoxLayout(self)
 
-        # მთავარი ჰორიზონტალური Splitter (მარცხენა და მარჯვენა მხარეს შორის)
+        self.logger = CANLogger()
+        self.is_recording = False
+
         main_splitter = QSplitter(Qt.Horizontal)
 
         # --- LEFT PANEL: CAN Live Table ---
@@ -138,19 +102,14 @@ class SnifferPage(QWidget):
             QHeaderView::section { background-color: #0f766e; color: white; font-weight: bold; padding: 4px; border: 1px solid #115e59; }
         """)
 
-        # --- RIGHT PANEL: Vertical Splitter (ცხრილსა და გრაფიკს შორის Drag-and-Drop) ---
+        # --- RIGHT PANEL ---
         right_splitter = QSplitter(Qt.Vertical)
         right_splitter.setStyleSheet("""
-            QSplitter::handle {
-                background-color: #2d3748;
-                height: 4px;
-            }
-            QSplitter::handle:hover {
-                background-color: #10b981;
-            }
+            QSplitter::handle { background-color: #2d3748; height: 4px; }
+            QSplitter::handle:hover { background-color: #10b981; }
         """)
 
-        # 1. ზედა ვიჯეტი: Decoded Signals Table
+        # 1. Decoded Signals Table
         table_container = QWidget()
         table_layout = QVBoxLayout(table_container)
         table_layout.setContentsMargins(5, 5, 5, 5)
@@ -172,7 +131,7 @@ class SnifferPage(QWidget):
         table_layout.addWidget(self.table)
         self.table.cellClicked.connect(self.on_signal_selected)
 
-        # 2. ქვედა ვიჯეტი: Graph Section
+        # 2. Graph Section
         plot_container = QWidget()
         plot_layout = QVBoxLayout(plot_container)
         plot_layout.setContentsMargins(5, 5, 5, 5)
@@ -184,14 +143,10 @@ class SnifferPage(QWidget):
         self.plot_canvas = UniversalPlotCanvas(self, width=5, height=3)
         plot_layout.addWidget(self.plot_canvas)
 
-        # ვამატებთ ორივე ვიჯეტს ვერტიკალურ Splitter-ში
         right_splitter.addWidget(table_container)
         right_splitter.addWidget(plot_container)
-        
-        # საწყისი პროპორციები (ცხრილი: 200px, გრაფიკი: 400px)
         right_splitter.setSizes([200, 400])
 
-        # ჩასმა მთავარ ჰორიზონტალურ Splitter-ში
         main_splitter.addWidget(self.can_table)
         main_splitter.addWidget(right_splitter)
         main_splitter.setSizes([550, 450])
@@ -200,33 +155,56 @@ class SnifferPage(QWidget):
         self.setLayout(layout)
 
         self.signals_data = {}
+        self.signal_row_map = {}
         self.selected_signal_id = None
 
-        # ტაიმერის ინიციალიზაცია (არ გაშვიათ ავტომატურად)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.simulate_incoming_can_data)
 
     def process_incoming_signal(self, signal_id: str, new_value: float):
+        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+        # Log frame if recording
+        if self.is_recording:
+            self.logger.log_frame(
+                timestamp=timestamp,
+                can_id=signal_id,
+                ext="0", rtr="0", direction="Rx", bus="1",
+                length=str(len(f"{new_value:.2f}")),
+                ascii_val=".",
+                data_bytes=f"{new_value:.2f}"
+            )
+
         if signal_id not in self.signals_data:
             self.signals_data[signal_id] = []
-            row_count = self.table.rowCount()
-            self.table.insertRow(row_count)
-            self.table.setItem(row_count, 0, QTableWidgetItem(signal_id))
-            self.table.setItem(row_count, 1, QTableWidgetItem(str(new_value)))
-            
-            if self.selected_signal_id is None:
-                self.selected_signal_id = signal_id
-                self.table.selectRow(0)
-                self.plot_header.setText(f"Live Visualization: {signal_id}")
-
         self.signals_data[signal_id].append(new_value)
 
-        for row in range(self.table.rowCount()):
-            if self.table.item(row, 0).text() == signal_id:
-                self.table.setItem(row, 1, QTableWidgetItem(f"{new_value:.1f}"))
-                break
+        # 1. Update CAN Live Table (Left Side)
+        row_idx = self.can_table.rowCount()
+        self.can_table.insertRow(row_idx)
+        self.can_table.setItem(row_idx, 0, QTableWidgetItem(timestamp))
+        self.can_table.setItem(row_idx, 1, QTableWidgetItem(signal_id))
+        self.can_table.setItem(row_idx, 8, QTableWidgetItem(f"{new_value:.2f}"))
+        self.can_table.scrollToBottom()
 
-        if signal_id == self.selected_signal_id:
+        # 2. Update Decoded Signals Table (Right Side Top)
+        if signal_id not in self.signal_row_map:
+            sig_row = self.table.rowCount()
+            self.table.insertRow(sig_row)
+            self.table.setItem(sig_row, 0, QTableWidgetItem(signal_id))
+            self.table.setItem(sig_row, 1, QTableWidgetItem(f"{new_value:.2f}"))
+            self.signal_row_map[signal_id] = sig_row
+        else:
+            sig_row = self.signal_row_map[signal_id]
+            self.table.setItem(sig_row, 1, QTableWidgetItem(f"{new_value:.2f}"))
+
+        # 3. Auto-select first signal if none selected yet
+        if not self.selected_signal_id:
+            self.selected_signal_id = signal_id
+            self.plot_header.setText(f"Live Visualization: {signal_id}")
+
+        # 4. Update Matplotlib Plot (Right Side Bottom)
+        if self.selected_signal_id == signal_id:
             self.plot_canvas.update_figure(self.signals_data[signal_id])
 
     def on_signal_selected(self, row, column):
@@ -247,22 +225,6 @@ class SnifferPage(QWidget):
             val = prev_val + random.uniform(-2, 3)
 
         self.process_incoming_signal(chosen_id, val)
-
-
-class HistoryPage(QWidget):
-    def __init__(self):
-        super().__init__()
-        layout = QVBoxLayout()
-        title = QLabel("Saved CAN Logs & History")
-        title.setStyleSheet("color: #10b981; font-size: 20px; font-weight: bold;")
-        
-        history_table = QTableWidget(5, 3)
-        history_table.setHorizontalHeaderLabels(["ID", "Data Byte", "Timestamp"])
-        history_table.setStyleSheet("gridline-color: #2d3748; background-color: #1b2421; color: #e2e8f0;")
-
-        layout.addWidget(title)
-        layout.addWidget(history_table)
-        self.setLayout(layout)
 
 
 class MainWindow(QMainWindow):
@@ -297,9 +259,7 @@ class MainWindow(QMainWindow):
                 font-weight: bold;
                 padding: 5px 12px;
             }
-            QPushButton:hover {
-                background-color: #059669;
-            }
+            QPushButton:hover { background-color: #059669; }
             QPushButton:disabled {
                 background-color: #1b2421;
                 color: #4a5568;
@@ -314,7 +274,6 @@ class MainWindow(QMainWindow):
         self.sniff_button = QPushButton(" Start Sniffing", self)
         self.sniff_button.setFixedSize(150, 36)
         self.sniff_button.setStyleSheet(button_style)
-        # საწყის ეტაპზე გათიშულია:
         self.sniff_button.setEnabled(False)
 
         self.btn_history = QPushButton(" History", self)
@@ -338,10 +297,18 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(self.stacked_widget)
 
-        # Event-ები
-        self.sniff_button.clicked.connect(self.toggle_sniffing)
-        self.btn_history.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(1))
+        # Event Signals
+        self.sniff_button.clicked.connect(self.handle_sniff_click)
+        self.btn_history.clicked.connect(self.show_history_page)
         self.connect_button.clicked.connect(self.open_connection_dialog)
+
+    def handle_sniff_click(self):
+        self.stacked_widget.setCurrentIndex(0)
+        self.toggle_sniffing()
+
+    def show_history_page(self):
+        self.history_page.load_log_files()
+        self.stacked_widget.setCurrentIndex(1)
 
     def open_connection_dialog(self):
         dialog = ConnectionDialog(self)
@@ -360,12 +327,15 @@ class MainWindow(QMainWindow):
                         padding: 5px 12px;
                     }
                 """)
-                # Connect-ის შემდეგ აქტიურდება Start Sniffing
                 self.sniff_button.setEnabled(True)
 
     def toggle_sniffing(self):
+        # 1. Stop Sniffing & Save
         if self.sniffer_page.timer.isActive():
             self.sniffer_page.timer.stop()
+            self.sniffer_page.is_recording = False
+            self.sniffer_page.logger.stop_logging()
+
             self.sniff_button.setText(" Start Sniffing")
             self.sniff_button.setStyleSheet("""
                 QPushButton {
@@ -379,8 +349,18 @@ class MainWindow(QMainWindow):
                 }
                 QPushButton:hover { background-color: #059669; }
             """)
+            
+            self.history_page.load_log_files()
+
+            saved_file = getattr(self.sniffer_page.logger, 'current_filename', 'Desktop/logs')
+            self.statusBar().showMessage(f"Log saved: {os.path.basename(saved_file)}", 5000)
+
+        # 2. Start Sniffing
         else:
+            self.sniffer_page.logger.start_logging()
+            self.sniffer_page.is_recording = True
             self.sniffer_page.timer.start(200)
+
             self.sniff_button.setText(" Stop Sniffing")
             self.sniff_button.setStyleSheet("""
                 QPushButton {
@@ -394,6 +374,8 @@ class MainWindow(QMainWindow):
                 }
                 QPushButton:hover { background-color: #dc2626; }
             """)
+            
+            self.statusBar().showMessage("Sniffing & Recording started...", 3000)
 
 
 if __name__ == "__main__":
