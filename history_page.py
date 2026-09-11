@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from plot_canvas import UniversalPlotCanvas
-
+from full_diagram import FullDiagramDialog
 
 class HistoryPage(QWidget):
     # Custom signal to notify MainWindow whether a log file is selected
@@ -180,10 +180,40 @@ class HistoryPage(QWidget):
         plot_layout = QVBoxLayout(plot_container)
         plot_layout.setContentsMargins(0, 4, 0, 0)
 
+        # 1. Header Bar Layout (Horizontal layout to place label and button side-by-side)
+        plot_header_layout = QHBoxLayout()
+
         self.plot_header = QLabel("Replay Visualization Diagram")
         self.plot_header.setStyleSheet("color: #10b981; font-size: 13px; font-weight: bold;")
-        plot_layout.addWidget(self.plot_header)
+        plot_header_layout.addWidget(self.plot_header)
 
+        # Add flexible space between label and your new button
+        plot_header_layout.addStretch()
+
+        # 2. Define the new button
+
+        self.custom_plot_btn = QPushButton("Full diagrams page")
+        
+        self.custom_plot_btn.setStyleSheet("""
+            QPushButton { 
+                background-color: #0f766e; 
+                color: white; 
+                font-weight: bold; 
+                padding: 4px 10px; 
+                border-radius: 4px; 
+            }
+            QPushButton:hover { background-color: #059669; }
+        """)
+        self.custom_plot_btn.setVisible(False)
+        # Connect to your desired slot function
+        self.custom_plot_btn.clicked.connect(self.all_diagrams_page)
+        
+        plot_header_layout.addWidget(self.custom_plot_btn)
+
+        # Add the horizontal header bar to the vertical plot layout
+        plot_layout.addLayout(plot_header_layout)
+
+        # 3. Add Canvas below the header bar
         self.plot_canvas = UniversalPlotCanvas(self, width=5, height=3)
         plot_layout.addWidget(self.plot_canvas)
 
@@ -202,10 +232,14 @@ class HistoryPage(QWidget):
 
     def on_log_item_clicked(self, item):
         """Single handler when an item in the log list is clicked."""
+        self.current_selected_log = item.text()
+        print(f"DEBUG: Selected log saved as -> '{self.current_selected_log}'")
         # 1. Emit signal so MainWindow can show the Analyze button
         self.log_selected_signal.emit(True)
         # 2. Parse and load the selected log
         self.load_selected_log(item)
+        self.custom_plot_btn.setVisible(True)
+
 
     def get_logs_directory(self):
         desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
@@ -213,6 +247,21 @@ class HistoryPage(QWidget):
         if not os.path.exists(logs_dir):
             os.makedirs(logs_dir, exist_ok=True)
         return logs_dir
+
+    def all_diagrams_page(self):
+        print("DEBUG: custom_plot_btn clicked!")
+        
+        selected_log = getattr(self, 'current_selected_log', None)
+        print(f"DEBUG: Current selected log value is -> '{selected_log}'")
+
+        if selected_log:
+            try:
+                dialog = FullDiagramDialog(log_data=selected_log, parent=self)
+                dialog.exec_()
+            except Exception as e:
+                print(f"DEBUG Error opening dialog: {e}")
+        else:
+            print("DEBUG: selected_log is None or Empty! Dialog will not open.")
 
     def load_log_files(self):
         self.log_list.clear()
@@ -232,6 +281,7 @@ class HistoryPage(QWidget):
         self.log_selected_signal.emit(False)
 
     def load_selected_log(self, item):
+        self.current_index = 0
         filepath = item.data(32)
         self.stop_replay()
         self.replay_data = []

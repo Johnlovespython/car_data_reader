@@ -2,16 +2,15 @@ import sys
 import os
 import random
 from datetime import datetime
-
+from full_diagram import FullDiagramDialog
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QPushButton, QWidget, QVBoxLayout, 
     QHBoxLayout, QLabel, QStackedWidget, QTableWidget, QHeaderView, 
-    QSplitter, QTableWidgetItem, QDialog, QComboBox
+    QSplitter, QTableWidgetItem, QDialog, QComboBox, QMessageBox
 )
 from PyQt5.QtCore import Qt, QTimer
 import serial.tools.list_ports
-
 import matplotlib
 matplotlib.use('Qt5Agg')
 
@@ -21,6 +20,7 @@ from logger import CANLogger
 from plot_canvas import UniversalPlotCanvas
 from history_page import HistoryPage
 from ai_helper_page import AIHelperPage
+
 
 class ConnectionDialog(QDialog):
     """COM Port Selection Popup Dialog"""
@@ -90,6 +90,7 @@ class SnifferPage(QWidget):
 
         self.logger = CANLogger()
         self.is_recording = False
+        self.current_log_filepath = None  # Holds active recording path
 
         main_splitter = QSplitter(Qt.Horizontal)
 
@@ -135,14 +136,35 @@ class SnifferPage(QWidget):
         table_layout.addWidget(self.table)
         self.table.cellClicked.connect(self.on_signal_selected)
 
-        # 2. Graph Section
+        # 2. Graph Section with Full Diagram Button Layout Fix
         plot_container = QWidget()
         plot_layout = QVBoxLayout(plot_container)
         plot_layout.setContentsMargins(5, 5, 5, 5)
 
+        # Header Row Layout
+        header_row = QHBoxLayout()
+
         self.plot_header = QLabel("Live Visualization: Select a signal")
-        self.plot_header.setStyleSheet("color: #10b981; font-size: 14px; font-weight: bold; margin-top: 2px;")
-        plot_layout.addWidget(self.plot_header)
+        self.plot_header.setStyleSheet("color: #10b981; font-size: 14px; font-weight: bold;")
+
+        self.full_diagram_btn = QPushButton("Show full diagram", self)
+        self.full_diagram_btn.setStyleSheet("""
+            QPushButton { 
+                background-color: #0f766e; 
+                color: white; 
+                font-weight: bold; 
+                padding: 4px 10px; 
+                border-radius: 4px; 
+            }
+            QPushButton:hover { background-color: #059669; }
+        """)
+        self.full_diagram_btn.clicked.connect(self.open_live_full_diagrams)
+
+        header_row.addWidget(self.plot_header)
+        header_row.addStretch()
+        header_row.addWidget(self.full_diagram_btn)
+
+        plot_layout.addLayout(header_row)
 
         self.plot_canvas = UniversalPlotCanvas(self, width=5, height=3)
         plot_layout.addWidget(self.plot_canvas)
@@ -165,6 +187,36 @@ class SnifferPage(QWidget):
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.simulate_incoming_can_data)
+
+    def open_live_full_diagrams(self):
+        """Opens the live diagram window for the current sniffing session."""
+        current_log = getattr(self, 'current_log_filepath', None)
+
+        if not current_log or not os.path.exists(current_log):
+            QMessageBox.warning(
+                self,
+                "Sniffing Not Active",
+                "Please start sniffing/logging first to view full live diagrams."
+            )
+            return
+
+        dialog = FullDiagramDialog(log_data=current_log, parent=self)
+        dialog.exec_()
+
+    def clear_data(self):
+        self.can_table.setRowCount(0)
+        self.table.setRowCount(0)
+
+        self.signal_row_map.clear()
+        self.signals_data.clear()
+        self.previous_signal_values.clear()
+        self.selected_signal_id = None
+
+        if hasattr(self.plot_canvas, 'ax'):
+            self.plot_canvas.ax.clear()
+            self.plot_canvas.draw()
+
+        self.plot_header.setText("Live Visualization: Select a signal")
 
     def process_incoming_signal(self, signal_id: str, new_value: float):
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -296,7 +348,6 @@ class MainWindow(QMainWindow):
         self.connect_button.setFixedSize(130, 36)
         self.connect_button.setStyleSheet(button_style)
 
-        # თავიდან ნაგულისხმევად აწერია Start Sniffing
         self.sniff_button = QPushButton(" Start Sniffing", self)
         self.sniff_button.setFixedSize(150, 36)
         self.sniff_button.setStyleSheet(button_style)
@@ -330,7 +381,6 @@ class MainWindow(QMainWindow):
         self.history_page = HistoryPage()
         self.ai_helper_page = AIHelperPage()
 
-
         self.stacked_widget.addWidget(self.sniffer_page)
         self.stacked_widget.addWidget(self.history_page)
         self.stacked_widget.addWidget(self.ai_helper_page)
@@ -354,20 +404,16 @@ class MainWindow(QMainWindow):
             self.btn_analyze.setVisible(is_selected)
 
     def handle_sniff_click(self):
-        # 1. თუ სხვა გვერდზე ვართ (მაგ. History), უბრალოდ გადავდივართ Sniffer-ზე
         if self.stacked_widget.currentWidget() != self.sniffer_page:
             self.stacked_widget.setCurrentWidget(self.sniffer_page)
             self.btn_analyze.setVisible(False)
             self.update_sniff_button_label()
-        # 2. თუ უკვე Sniffer-ზე ვართ, ვრთავთ/ვთიშავთ სნიფინგს
         else:
             self.toggle_sniffing()
 
     def show_history_page(self):
         self.history_page.load_log_files()
         self.stacked_widget.setCurrentWidget(self.history_page)
-
-        # გვერდის შეცვლის შემდეგ ვაახლებთ ღილაკის ტექსტს (გახდება "Sniffer page")
         self.update_sniff_button_label()
 
         has_selection = len(self.history_page.log_list.selectedItems()) > 0
@@ -378,10 +424,8 @@ class MainWindow(QMainWindow):
         is_active = self.sniffer_page.timer.isActive()
 
         if not is_on_sniffer:
-            # History-ზე ყოფნისას ღილაკს აწერია Sniffer page
             self.sniff_button.setText(" Sniffer page")
         else:
-            # Sniffer-ზე ყოფნისას ტექსტი დამოკიდებულია პროცესის სტატუსზე
             if is_active:
                 self.sniff_button.setText(" Stop Sniffing")
             else:
@@ -428,7 +472,6 @@ class MainWindow(QMainWindow):
             """)
             
             self.history_page.load_log_files()
-
             saved_file = getattr(self.sniffer_page.logger, 'current_filename', 'Desktop/logs')
             self.statusBar().showMessage(f"Log saved: {os.path.basename(saved_file)}", 5000)
 
@@ -436,7 +479,12 @@ class MainWindow(QMainWindow):
         else:
             self.sniffer_page.logger.start_logging()
             self.sniffer_page.is_recording = True
+            
+            # Pass the updated file path directly to the SnifferPage instance
+            self.sniffer_page.current_log_filepath = self.sniffer_page.logger.current_filename
+
             self.sniffer_page.timer.start(200)
+            self.sniffer_page.clear_data()
 
             self.sniff_button.setText(" Stop Sniffing")
             self.sniff_button.setStyleSheet("""
