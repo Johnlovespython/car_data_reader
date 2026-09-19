@@ -29,18 +29,24 @@
 
   SERIAL PROTOCOL (one line per CAN frame, 115200 baud)
   -------------------------------------------------------
-  FRAME,<id_hex>,<ext 0/1>,<rtr 0/1>,<dlc>,<data bytes as hex, space separated>
+  <millis>,0x<id_hex>,<dlc>,<data bytes as hex, space separated>
   Example:
-  FRAME,316,0,0,8,4A 3F 00 12 00 00 00 00
+  156644,0x003,5,03 0F 60 1F 00
+  156645,0x41B,8,FD 1A 04 FF FF FF FF FF
 
-  Also emits:
+  Standard (11-bit) IDs print as 3 hex digits; extended (29-bit) IDs
+  print as 8 hex digits, so the PC side can tell them apart from the
+  ID's length/magnitude alone.
+
+  Also emits (lines starting with a letter, not a digit):
   READY,...   once the bridge is up
   ERR,...     if something goes wrong
 */
 
 #include "driver/twai.h"
-#define CAN_TX_PIN GPIO_NUM_25
-#define CAN_RX_PIN GPIO_NUM_26
+
+#define CAN_TX_PIN GPIO_NUM_5
+#define CAN_RX_PIN GPIO_NUM_4
 
 // Most vehicle HS-CAN diagnostic buses run at 500 kbit/s.
 // If your car is one of the few running 250 kbit/s (some older
@@ -92,19 +98,28 @@ void loop() {
 }
 
 void sendFrameOverSerial(const twai_message_t &msg) {
-  String line = "FRAME,";
-  line += String(msg.identifier, HEX);
-  line += ",";
-  line += (msg.extd ? "1" : "0");
-  line += ",";
-  line += (msg.rtr ? "1" : "0");
+  // Format: <millis>,0x<ID hex>,<dlc>,<data bytes hex, space separated>
+  // Standard (11-bit) IDs are printed as 3 hex digits, extended (29-bit)
+  // IDs as 8 hex digits, e.g. 0x003 vs 0x1FFFFFFF - this lets the PC
+  // side tell them apart just by looking at the ID's magnitude.
+  char idBuf[9];
+  if (msg.extd) {
+    sprintf(idBuf, "%08lX", (unsigned long)msg.identifier);
+  } else {
+    sprintf(idBuf, "%03lX", (unsigned long)msg.identifier);
+  }
+
+  String line = String(millis());
+  line += ",0x";
+  line += idBuf;
   line += ",";
   line += String(msg.data_length_code);
   line += ",";
 
+  char byteBuf[3];
   for (int i = 0; i < msg.data_length_code; i++) {
-    if (msg.data[i] < 0x10) line += "0";
-    line += String(msg.data[i], HEX);
+    sprintf(byteBuf, "%02X", msg.data[i]);
+    line += byteBuf;
     if (i < msg.data_length_code - 1) line += " ";
   }
 

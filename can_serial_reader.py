@@ -7,9 +7,17 @@ them into Qt signals the rest of the app can consume without ever
 blocking the GUI thread.
 
 Wire protocol (one line per CAN frame, sent by the ESP32 sketch):
-    FRAME,<id_hex>,<ext 0/1>,<rtr 0/1>,<dlc>,<data bytes hex space separated>
+    <millis>,0x<id_hex>,<dlc>,<data bytes hex space separated>
 Example:
-    FRAME,316,0,0,8,4A 3F 00 12 00 00 00 00
+    156644,0x003,5,03 0F 60 1F 00
+    156645,0x41B,8,FD 1A 04 FF FF FF FF FF
+
+Standard (11-bit) IDs come in as 3 hex digits, extended (29-bit) IDs
+as 8 hex digits - extended/RTR flags aren't in this format, so we
+infer "extended" from the numeric ID being too big for 11 bits, and
+RTR is not currently detected (defaults to False). If you need real
+RTR detection, add a flag to the ESP32 sketch's output line and to
+_parse_frame below.
 
 Requires: pip install pyserial
 """
@@ -73,7 +81,8 @@ class CANSerialReader(QThread):
             if not line:
                 continue
 
-            if line.startswith("FRAME,"):
+            if line[0].isdigit():
+                # A real frame line always starts with the millis timestamp.
                 frame = self._parse_frame(line)
                 if frame is not None:
                     self.frame_received.emit(frame)
@@ -90,18 +99,23 @@ class CANSerialReader(QThread):
     def _parse_frame(line: str):
         try:
             parts = line.split(",")
-            # parts[0] == "FRAME"
-            can_id_hex = parts[1]
-            extended = parts[2] == "1"
-            rtr = parts[3] == "1"
-            dlc = int(parts[4])
-            data_str = parts[5] if len(parts) > 5 else ""
+            # parts[0] = millis timestamp (informational only, we timestamp
+            #            with the PC's own clock elsewhere for display)
+            # parts[1] = "0x<hex id>"
+            # parts[2] = dlc
+            # parts[3] = data bytes, hex, space separated
+            id_hex = parts[1]
+            dlc = int(parts[2])
+            data_str = parts[3] if len(parts) > 3 else ""
             data_bytes = [int(b, 16) for b in data_str.split()] if data_str else []
 
+            can_id_int = int(id_hex, 16)  # works fine with the "0x" prefix
+            extended = can_id_int > 0x7FF  # doesn't fit in an 11-bit standard ID
+
             return CANFrame(
-                can_id=f"0x{can_id_hex.upper()}",
+                can_id=f"0x{can_id_int:03X}" if not extended else f"0x{can_id_int:08X}",
                 extended=extended,
-                rtr=rtr,
+                rtr=False,  # not present in this wire format
                 dlc=dlc,
                 data=data_bytes,
             )
