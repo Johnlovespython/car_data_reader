@@ -5,11 +5,11 @@ from datetime import datetime
 from full_diagram import FullDiagramDialog
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QPushButton, QWidget, QVBoxLayout, 
-    QHBoxLayout, QLabel, QStackedWidget, QTableWidget, QHeaderView, 
+    QApplication, QMainWindow, QPushButton, QWidget, QVBoxLayout,
+    QHBoxLayout, QLabel, QStackedWidget, QTableWidget, QHeaderView,
     QSplitter, QTableWidgetItem, QDialog, QComboBox, QMessageBox
 )
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 import serial.tools.list_ports
 import matplotlib
 matplotlib.use('Qt5Agg')
@@ -20,6 +20,11 @@ from logger import CANLogger
 from plot_canvas import UniversalPlotCanvas
 from history_page import HistoryPage
 from ai_helper_page import AIHelperPage
+from can_serial_reader import CANSerialReader, CANFrame
+
+# Special "port" value used to fall back to the built-in pseudo-data
+# generator, so you can still exercise the UI with no ESP32 attached.
+SIMULATE_PORT_TOKEN = "SIMULATE"
 
 
 class ConnectionDialog(QDialog):
@@ -28,7 +33,7 @@ class ConnectionDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Select Serial Port")
         self.setFixedSize(320, 160)
-        
+
         self.setStyleSheet("""
             QDialog {
                 background-color: #121816;
@@ -56,14 +61,14 @@ class ConnectionDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("Available COM Ports:"))
-        
+
         self.port_combo = QComboBox()
         layout.addWidget(self.port_combo)
 
         btn_layout = QHBoxLayout()
         self.btn_refresh = QPushButton("Refresh")
         self.btn_connect = QPushButton("Connect")
-        
+
         btn_layout.addWidget(self.btn_refresh)
         btn_layout.addWidget(self.btn_connect)
         layout.addLayout(btn_layout)
@@ -78,12 +83,18 @@ class ConnectionDialog(QDialog):
         ports = serial.tools.list_ports.comports()
         for p in ports:
             self.port_combo.addItem(f"{p.device} ({p.description})", p.device)
+        # Always offer a no-hardware fallback so the UI can be tested
+        # without the ESP32 plugged in.
+        self.port_combo.addItem("Simulate (no hardware)", SIMULATE_PORT_TOKEN)
 
     def get_selected_port(self):
         return self.port_combo.currentData()
 
 
 class SnifferPage(QWidget):
+
+    status_update = pyqtSignal(str)
+
     def __init__(self):
         super().__init__()
         layout = QVBoxLayout(self)
@@ -185,8 +196,42 @@ class SnifferPage(QWidget):
         self.signal_row_map = {}
         self.selected_signal_id = None
 
+        # Simulate-mode timer (no hardware attached)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.simulate_incoming_can_data)
+
+        # Real hardware: background thread owning the serial port
+        self.can_reader = None
+
+    # ------------------------------------------------------------------
+    # Starting / stopping data acquisition (real hardware or simulation)
+    # ------------------------------------------------------------------
+    def start_acquisition(self, port: str):
+        """port is either a real COM/tty device path, or SIMULATE_PORT_TOKEN."""
+        if port == SIMULATE_PORT_TOKEN:
+            self.timer.start(200)
+            self.status_update.emit("Simulating CAN data (no hardware)")
+            return
+
+        self.can_reader = CANSerialReader(port, baudrate=115200)
+        self.can_reader.frame_received.connect(self.process_incoming_frame)
+        self.can_reader.status_message.connect(self.status_update.emit)
+        self.can_reader.connection_lost.connect(self._on_connection_lost)
+        self.can_reader.start()
+
+    def stop_acquisition(self):
+        if self.timer.isActive():
+            self.timer.stop()
+        if self.can_reader is not None:
+            self.can_reader.stop()
+            self.can_reader = None
+
+    def is_acquisition_active(self) -> bool:
+        return self.timer.isActive() or (self.can_reader is not None and self.can_reader.isRunning())
+
+    def _on_connection_lost(self, message: str):
+        self.status_update.emit(message)
+        self.stop_acquisition()
 
     def open_live_full_diagrams(self):
         """Opens the live diagram window for the current sniffing session."""
@@ -218,29 +263,66 @@ class SnifferPage(QWidget):
 
         self.plot_header.setText("Live Visualization: Select a signal")
 
-    def process_incoming_signal(self, signal_id: str, new_value: float):
+    # ------------------------------------------------------------------
+    # Real CAN frame handling (from the ESP32 bridge)
+    # ------------------------------------------------------------------
+    def process_incoming_frame(self, frame: CANFrame):
+        """
+        Handles one real CAN frame coming off the ESP32 bridge.
+        Logs the raw frame in full, and feeds a numeric view of it into
+        the existing decoded-signal table / plot so you keep the same
+        UI you already built. Real per-signal decoding (via a DBC file)
+        can replace the "numeric_value" heuristic below later.
+        """
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        data_hex = " ".join(f"{b:02X}" for b in frame.data)
+        ascii_repr = "".join(chr(b) if 32 <= b < 127 else "." for b in frame.data)
 
         if self.is_recording:
             self.logger.log_frame(
                 timestamp=timestamp,
-                can_id=signal_id,
-                ext="0", rtr="0", direction="Rx", bus="1",
-                length=str(len(f"{new_value:.2f}")),
-                ascii_val=".",
-                data_bytes=f"{new_value:.2f}"
+                can_id=frame.can_id,
+                ext="1" if frame.extended else "0",
+                rtr="1" if frame.rtr else "0",
+                direction="Rx",
+                bus="1",
+                length=str(frame.dlc),
+                ascii_val=ascii_repr,
+                data_bytes=data_hex,
             )
 
-        if signal_id not in self.signals_data:
-            self.signals_data[signal_id] = []
-        self.signals_data[signal_id].append(new_value)
-
+        # --- Raw frame table (left panel) ---
         row_idx = self.can_table.rowCount()
         self.can_table.insertRow(row_idx)
         self.can_table.setItem(row_idx, 0, QTableWidgetItem(timestamp))
-        self.can_table.setItem(row_idx, 1, QTableWidgetItem(signal_id))
-        self.can_table.setItem(row_idx, 8, QTableWidgetItem(f"{new_value:.2f}"))
+        self.can_table.setItem(row_idx, 1, QTableWidgetItem(frame.can_id))
+        self.can_table.setItem(row_idx, 2, QTableWidgetItem("1" if frame.extended else "0"))
+        self.can_table.setItem(row_idx, 3, QTableWidgetItem("1" if frame.rtr else "0"))
+        self.can_table.setItem(row_idx, 4, QTableWidgetItem("Rx"))
+        self.can_table.setItem(row_idx, 5, QTableWidgetItem("1"))
+        self.can_table.setItem(row_idx, 6, QTableWidgetItem(str(frame.dlc)))
+        self.can_table.setItem(row_idx, 7, QTableWidgetItem(ascii_repr))
+        self.can_table.setItem(row_idx, 8, QTableWidgetItem(data_hex))
         self.can_table.scrollToBottom()
+
+        # --- Decoded signal panel / plot (right panel) ---
+        # Placeholder decoding: treat the first two data bytes as a
+        # big-endian numeric value per CAN ID, purely so the existing
+        # plot keeps working. Swap this out once you add real DBC
+        # signal definitions for your car.
+        if len(frame.data) >= 2:
+            numeric_value = (frame.data[0] << 8) | frame.data[1]
+        elif len(frame.data) == 1:
+            numeric_value = frame.data[0]
+        else:
+            numeric_value = 0
+
+        self._update_decoded_signal(frame.can_id, numeric_value)
+
+    def _update_decoded_signal(self, signal_id: str, new_value: float):
+        if signal_id not in self.signals_data:
+            self.signals_data[signal_id] = []
+        self.signals_data[signal_id].append(new_value)
 
         old_val = self.previous_signal_values.get(signal_id)
         has_changed = (old_val is not None) and (old_val != new_value)
@@ -291,17 +373,39 @@ class SnifferPage(QWidget):
         if signal_id in self.signals_data:
             self.plot_canvas.update_figure(self.signals_data[signal_id])
 
+    # ------------------------------------------------------------------
+    # Simulate mode (no hardware) - kept from the original app so the UI
+    # stays testable without an ESP32 attached.
+    # ------------------------------------------------------------------
     def simulate_incoming_can_data(self):
         mock_signals = ["0x208", "0x316", "0x1A0", "0x420"]
         chosen_id = random.choice(mock_signals)
-        
+
         if chosen_id not in self.signals_data:
             val = random.uniform(50, 100)
         else:
             prev_val = self.signals_data[chosen_id][-1]
             val = prev_val + random.uniform(-2, 3)
 
-        self.process_incoming_signal(chosen_id, val)
+        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        if self.is_recording:
+            self.logger.log_frame(
+                timestamp=timestamp,
+                can_id=chosen_id,
+                ext="0", rtr="0", direction="Rx", bus="1",
+                length=str(len(f"{val:.2f}")),
+                ascii_val=".",
+                data_bytes=f"{val:.2f}"
+            )
+
+        row_idx = self.can_table.rowCount()
+        self.can_table.insertRow(row_idx)
+        self.can_table.setItem(row_idx, 0, QTableWidgetItem(timestamp))
+        self.can_table.setItem(row_idx, 1, QTableWidgetItem(chosen_id))
+        self.can_table.setItem(row_idx, 8, QTableWidgetItem(f"{val:.2f}"))
+        self.can_table.scrollToBottom()
+
+        self._update_decoded_signal(chosen_id, val)
 
 
 class MainWindow(QMainWindow):
@@ -309,6 +413,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("SavvyPy - Dynamic CAN Analyzer")
         self.setGeometry(100, 100, 1200, 700)
+        self.selected_port = None
         self.initUI()
 
     def initUI(self):
@@ -395,6 +500,7 @@ class MainWindow(QMainWindow):
         self.btn_analyze.clicked.connect(self.go_to_ai_helper)
 
         self.history_page.log_selected_signal.connect(self.handle_log_selection)
+        self.sniffer_page.status_update.connect(lambda m: self.statusBar().showMessage(m, 4000))
 
     def go_to_ai_helper(self):
         self.stacked_widget.setCurrentWidget(self.ai_helper_page)
@@ -421,7 +527,7 @@ class MainWindow(QMainWindow):
 
     def update_sniff_button_label(self):
         is_on_sniffer = (self.stacked_widget.currentWidget() == self.sniffer_page)
-        is_active = self.sniffer_page.timer.isActive()
+        is_active = self.sniffer_page.is_acquisition_active()
 
         if not is_on_sniffer:
             self.sniff_button.setText(" Sniffer page")
@@ -436,7 +542,9 @@ class MainWindow(QMainWindow):
         if dialog.exec_() == QDialog.Accepted:
             selected_port = dialog.get_selected_port()
             if selected_port:
-                self.connect_button.setText(f" Connected ({selected_port})")
+                self.selected_port = selected_port
+                label = "Simulate mode" if selected_port == SIMULATE_PORT_TOKEN else selected_port
+                self.connect_button.setText(f" Connected ({label})")
                 self.connect_button.setStyleSheet("""
                     QPushButton {
                         color: #ffffff;
@@ -452,8 +560,8 @@ class MainWindow(QMainWindow):
 
     def toggle_sniffing(self):
         # 1. Stop Sniffing & Save Log
-        if self.sniffer_page.timer.isActive():
-            self.sniffer_page.timer.stop()
+        if self.sniffer_page.is_acquisition_active():
+            self.sniffer_page.stop_acquisition()
             self.sniffer_page.is_recording = False
             self.sniffer_page.logger.stop_logging()
 
@@ -470,21 +578,25 @@ class MainWindow(QMainWindow):
                 }
                 QPushButton:hover { background-color: #059669; }
             """)
-            
+
             self.history_page.load_log_files()
             saved_file = getattr(self.sniffer_page.logger, 'current_filename', 'Desktop/logs')
             self.statusBar().showMessage(f"Log saved: {os.path.basename(saved_file)}", 5000)
 
         # 2. Start Sniffing
         else:
+            if not self.selected_port:
+                QMessageBox.warning(self, "No Port Selected", "Please connect to a port first.")
+                return
+
             self.sniffer_page.logger.start_logging()
             self.sniffer_page.is_recording = True
-            
+
             # Pass the updated file path directly to the SnifferPage instance
             self.sniffer_page.current_log_filepath = self.sniffer_page.logger.current_filename
 
-            self.sniffer_page.timer.start(200)
             self.sniffer_page.clear_data()
+            self.sniffer_page.start_acquisition(self.selected_port)
 
             self.sniff_button.setText(" Stop Sniffing")
             self.sniff_button.setStyleSheet("""
@@ -499,7 +611,7 @@ class MainWindow(QMainWindow):
                 }
                 QPushButton:hover { background-color: #dc2626; }
             """)
-            
+
             self.statusBar().showMessage("Sniffing & Recording started...", 3000)
 
     def open_settings_dialog(self):
